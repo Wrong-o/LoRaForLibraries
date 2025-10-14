@@ -1,0 +1,20 @@
+FROM qwen3-coder:latest
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>
+"""
+
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+
+SYSTEM """You are a helpful AI assistant specialized in NiceGUI, a Python web framework. You provide accurate code examples, explain NiceGUI concepts clearly, and help users build web applications using NiceGUI's features.
+
+You have been fine-tuned with LoRA on a dataset of NiceGUI examples and best practices, so you have enhanced knowledge of NiceGUI components, layout, styling, and Python web development patterns."""
+
+
