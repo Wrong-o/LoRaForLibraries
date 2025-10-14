@@ -92,21 +92,58 @@ def extract_code_from_text(text: str) -> str:
 
 def enforce_run_args(code: str) -> str:
     """Ensure generated code runs with required NiceGUI run args and imports os.
-    - add `import os` if missing
-    - replace any ui.run(...) with ui.run(port=int(os.getenv('PORT', 8765)), show=False, reload=False)
-    - append a run call if none exists
+    Strategy: comment out any existing ui.run(...) call(s) line-by-line (robust to multi-line),
+    then append a single correct run call at the end. Also ensure `import os` exists.
     """
-    changed = False
+    # Ensure import os at top (avoid duplicates)
     if "import os" not in code:
         code = "import os\n" + code
-        changed = True
-    pattern = re.compile(r"ui\.run\((.*?)\)", re.DOTALL)
-    if pattern.search(code):
-        code = pattern.sub("ui.run(port=int(os.getenv('PORT', 8765)), show=False, reload=False)", code)
-        changed = True
-    else:
-        code = code.rstrip() + "\n\nui.run(port=int(os.getenv('PORT', 8765)), show=False, reload=False)\n"
-        changed = True
+
+    lines = code.splitlines()
+    new_lines: List[str] = []
+    commenting = False
+    paren_depth = 0
+    for line in lines:
+        if not commenting and "ui.run(" in line:
+            commenting = True
+            # initialize depth count using parentheses on this line starting from the first ui.run(
+            idx = line.find("ui.run(")
+            # Count parentheses from idx
+            segment = line[idx:]
+            paren_depth = segment.count("(") - segment.count(")")
+            new_lines.append("# " + line)
+            if paren_depth <= 0:
+                commenting = False
+            continue
+        if commenting:
+            # Update depth across continued lines
+            paren_depth += line.count("(") - line.count(")")
+            new_lines.append("# " + line)
+            if paren_depth <= 0:
+                commenting = False
+            continue
+        new_lines.append(line)
+
+    if commenting:
+        # Close any dangling comment block
+        commenting = False
+
+    code_no_runs = "\n".join(new_lines).rstrip()
+    # Append our enforced single-line run
+    code_no_runs += "\n\nui.run(port=int(os.getenv('PORT', 8765)), show=False, reload=False)\n"
+    return code_no_runs
+
+
+def normalize_datatestid_props(code: str) -> str:
+    """Rewrite common mistakes to proper NiceGUI props('data-testid=...').
+    - Replace .data_testid('X') => .props('data-testid=X')
+    - Replace .data_testid("X") => .props('data-testid=X')
+    - Replace set_data_testid variants if any
+    """
+    code = re.sub(r"\.data_testid\(\s*'([^']+)'\s*\)", r".props('data-testid=\1')", code)
+    code = re.sub(r'\.data_testid\(\s*"([^"]+)"\s*\)', r".props('data-testid=\1')", code)
+    code = re.sub(r"\.set_data_testid\(\s*'([^']+)'\s*\)", r".props('data-testid=\1')", code)
+    code = re.sub(r'\.set_data_testid\(\s*"([^"]+)"\s*\)', r".props('data-testid=\1')", code)
     return code
 
 
@@ -165,6 +202,7 @@ async def generate_and_save_app(run_dir: str, model: str, task: Dict[str, Any], 
     raw_text = result.get("message", {}).get("content", "")
     code = extract_code_from_text(raw_text)
     code = enforce_run_args(code)
+    code = normalize_datatestid_props(code)
     model_dir = os.path.join(run_dir, f"attempt_{attempt}")
     mkdir_p(model_dir)
     write_text(os.path.join(model_dir, "raw.txt"), raw_text)

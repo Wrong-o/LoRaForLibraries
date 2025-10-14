@@ -56,8 +56,10 @@ def _basic_tabs() -> Dict[str, Any]:
             "tab-panel",
         ],
         "prompt": (
-            "Create a page with two tabs A and B.\n"
+            "Create a page with two tabs A and B using NiceGUI's ui.tabs with a bound value.\n"
             "Required elements with exact data-testid: tab-a, tab-b, tab-panel.\n"
+            "Use a tabs component with value='A' initially and update selection using tabs.set_value('B') or by setting tabs.value = 'B'.\n"
+            "Do NOT call methods on ui.tab items like set_selected (that API does not exist).\n"
             "Switching to B must update tab-panel to contain the text 'B'.\n"
         ),
         "sequence": [
@@ -309,6 +311,8 @@ POST /test/reset; POST /test/click {testid}; POST /test/input {testid,value}; PO
 GET /test/text?testid=... returns current visible text for that element as {"text": "..."}. 
 Return 400 for unknown testid. The code must be a single Python file runnable with 'python file.py'.
 When running the app, do not auto-open a browser (set show=False) and disable auto-reload (set reload=False). Call ui.run(port=int(os.getenv('PORT', 8765)), show=False, reload=False).
+Implementation constraints: only use official NiceGUI APIs; do not call non-existent methods on components. For tabs, use ui.tabs with a string value (e.g., value='A') and switch via tabs.set_value('B') or by updating tabs.value; do NOT call methods on ui.tab items like set_selected.
+Set data-testid using NiceGUI's props API: element.props('data-testid=...'). Do NOT use element.data_testid(...).
 """
 
 
