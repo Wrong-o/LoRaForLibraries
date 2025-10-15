@@ -403,174 +403,208 @@ class SuiteRunner:
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
         self.ts: str = now_ts()
         self.current_task_index: int = -1
-        self.next_event: Optional[asyncio.Event] = None
         self.results: List[Dict[str, Any]] = []
         self.iframes_container = None
         self.status_container = None
         self.results_container = None
-
-    async def run_suite(self) -> None:
-        for idx, task in enumerate(tasks_list):
-            self.current_task_index = idx
-            # alternate order: even A->B, odd B->A
-            order: List[Tuple[str, int, str]]
-            if idx % 2 == 0:
-                order = [(self.model_a, PORT_A, "A"), (self.model_b, PORT_B, "B")]
-            else:
-                order = [(self.model_b, PORT_A, "B"), (self.model_a, PORT_B, "A")]
-
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            task_dir = os.path.join(base_dir, "runs", self.ts, task["id"])  # absolute under project
-            mkdir_p(task_dir)
-
-            # Generation
-            if self.status_container is not None:
-                self.status_container.clear()
-                with self.status_container:
-                    ui.label(f"Generating code for {task['title']}...")
-            gen_dirs: Dict[str, str] = {}
-            gen_meta: Dict[str, Dict[str, Any]] = {}
-            for model_name, port, tag in order:
-                model_dir = os.path.join(task_dir, tag)
-                mkdir_p(model_dir)
-                attempt = 1
-                try:
-                    subdir, meta = await generate_and_save_app(model_dir, model_name, task, attempt, self.system_prompt)
-                    gen_dirs[tag] = subdir
-                    gen_meta[tag] = meta
-                except Exception as e:
-                    write_text(os.path.join(model_dir, "error.txt"), f"generation error: {e}")
-                    if self.status_container is not None:
-                        with self.status_container:
-                            ui.label(f"Generation failed for {tag}: {e}").classes('text-red-600')
-                    gen_dirs[tag] = model_dir
-
-            # Start both apps concurrently
-            procs: Dict[str, Tuple[Any, Any, Any]] = {}
-            for model_name, port, tag in order:
-                app_dir = gen_dirs[tag]
-                try:
-                    proc, out_f, err_f = await start_app_subprocess(app_dir, port)
-                    procs[tag] = (proc, out_f, err_f)
-                except Exception as e:
-                    write_text(os.path.join(app_dir, "start_error.txt"), f"start error: {e}")
-                    if self.status_container is not None:
-                        with self.status_container:
-                            ui.label(f"Start failed for {tag}: {e}").classes('text-red-600')
-
-            # Wait for startup
-            started_a, started_b = await asyncio.gather(
-                wait_for_startup(PORT_A, task["timeouts"]["startup"]),
-                wait_for_startup(PORT_B, task["timeouts"]["startup"]),
-            )
-            if self.status_container is not None:
-                self.status_container.clear()
-                with self.status_container:
-                    ui.label(f"Startup A: {'OK' if started_a else 'FAIL'}  B: {'OK' if started_b else 'FAIL'}")
-                    # If failed, show stderr tail for quick diagnosis
-                    for tag, started in ((order[0][2], started_a), (order[1][2], started_b)):
-                        if not started:
-                            try:
-                                err_path = os.path.join(gen_dirs[tag], "stderr.txt")
-                                tail = open(err_path, 'r', encoding='utf-8').read()[-500:]
-                                ui.label(f"{tag} stderr tail:").classes('text-red-600')
-                                ui.label(tail).classes('text-xs text-red-600 whitespace-pre-wrap')
-                            except Exception:
-                                pass
-            if not (started_a or started_b):
-                # Skip to next task if neither started
-                continue
-
-            # Show manual iframes
-            if self.iframes_container is not None:
-                self.iframes_container.clear()
-                with self.iframes_container:
-                    ui.label(f"Manual review: {task['title']}")
-                    with ui.row().classes('w-full gap-4'):
-                        ui.html(f'<iframe src="http://127.0.0.1:{PORT_A}/" style="width:100%;height:420px;border:1px solid #ddd;"></iframe>', sanitize=False).classes('flex-1')
-                        ui.html(f'<iframe src="http://127.0.0.1:{PORT_B}/" style="width:100%;height:420px;border:1px solid #ddd;"></iframe>', sanitize=False).classes('flex-1')
-                    next_btn = ui.button("Next test")
-                    self.next_event = asyncio.Event()
-                    next_btn.on("click", lambda e: self.next_event.set() if self.next_event else None)
-
-            if self.next_event is not None:
-                await self.next_event.wait()
-                self.next_event = None
-
-            # Automated probes
-            logs_a: List[Dict[str, Any]] = []
-            logs_b: List[Dict[str, Any]] = []
-
-            res_a, res_b = await asyncio.gather(
-                evaluate_model(gen_dirs[order[0][2]], PORT_A, task, task["timeouts"], logs_a),
-                evaluate_model(gen_dirs[order[1][2]], PORT_B, task, task["timeouts"], logs_b),
-            )
-
-            # Optional re-generation if < 3.5
-            async def maybe_regen(tag: str, res: ModelRunResult) -> ModelRunResult:
-                if res.score >= 3.5:
-                    return res
-                model_name = order[0][0] if tag == order[0][2] else order[1][0]
-                parent_dir = os.path.join(task_dir, tag)
-                subdir, _ = generate_and_save_app(parent_dir, model_name, task, 2, self.system_prompt)
-                # restart app on same port
-                # Kill old proc is complex since we used asyncio subprocess; to simplify, we skip auto-regen live run
-                # and just keep the first attempt's score for now
-                return res
-
-            res_a = await maybe_regen(order[0][2], res_a)
-            res_b = await maybe_regen(order[1][2], res_b)
-
-            # Archive logs
-            write_text(os.path.join(gen_dirs[order[0][2]], "probe_logs.jsonl"), "\n".join(json.dumps(x) for x in logs_a))
-            write_text(os.path.join(gen_dirs[order[1][2]], "probe_logs.jsonl"), "\n".join(json.dumps(x) for x in logs_b))
-
-            # Collect results
-            self.results.append({
-                "task_id": task["id"],
-                "task_title": task["title"],
-                "A_score": res_a.score,
-                "B_score": res_b.score,
-            })
-
-            # Kill subprocesses (best-effort)
-            for tag, (proc, out_f, err_f) in procs.items():
-                try:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=3.0)
-                    except Exception:
-                        proc.kill()
-                except Exception:
-                    pass
-                try:
-                    out_f.close()
-                except Exception:
-                    pass
-                try:
-                    err_f.close()
-                except Exception:
-                    pass
-
-            # Update status UI
-            if self.status_container is not None:
-                self.status_container.clear()
-                with self.status_container:
-                    ui.label(f"Completed: {task['title']} -> A {res_a.score:.2f}, B {res_b.score:.2f}")
-
-        # Summary table
+        self.procs: Dict[str, Tuple[Any, Any, Any]] = {}
+        
+    def update_results_display(self) -> None:
+        """Update the results table with current results data."""
         if self.results_container is not None:
             self.results_container.clear()
             with self.results_container:
-                with ui.row().classes('w-full font-semibold'):
-                    ui.label('Task').classes('w-2/3')
-                    ui.label('A score').classes('w-1/6')
-                    ui.label('B score').classes('w-1/6')
-                for r in self.results:
-                    with ui.row().classes('w-full'):
-                        ui.label(r["task_title"]).classes('w-2/3')
-                        ui.label(f"{r['A_score']:.2f}").classes('w-1/6')
-                        ui.label(f"{r['B_score']:.2f}").classes('w-1/6')
+                with ui.grid(columns=3).classes('w-full gap-x-4'):
+                    ui.label('Task').classes('font-semibold')
+                    ui.label(f'Model A ({self.model_a})').classes('font-semibold')
+                    ui.label(f'Model B ({self.model_b})').classes('font-semibold')
+                    for r in self.results:
+                        ui.label(r["task_title"])
+                        ui.label(f"{r['A_score']:.2f}")
+                        ui.label(f"{r['B_score']:.2f}")
+
+    async def kill_existing_procs(self) -> None:
+        """Kill any existing running processes."""
+        for tag, (proc, out_f, err_f) in self.procs.items():
+            try:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
+            try:
+                out_f.close()
+            except Exception:
+                pass
+            try:
+                err_f.close()
+            except Exception:
+                pass
+        self.procs = {}
+
+    async def run_task(self, task: Dict[str, Any], idx: int) -> None:
+        """Run a single task."""
+        # Kill any existing processes first
+        await self.kill_existing_procs()
+        
+        self.current_task_index = idx
+        # alternate order: even A->B, odd B->A
+        order: List[Tuple[str, int, str]]
+        if idx % 2 == 0:
+            order = [(self.model_a, PORT_A, "A"), (self.model_b, PORT_B, "B")]
+        else:
+            order = [(self.model_b, PORT_A, "B"), (self.model_a, PORT_B, "A")]
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        task_dir = os.path.join(base_dir, "runs", self.ts, task["id"])  # absolute under project
+        mkdir_p(task_dir)
+
+        # Generation
+        if self.status_container is not None:
+            self.status_container.clear()
+            with self.status_container:
+                ui.label(f"Generating code for {task['title']}...")
+        gen_dirs: Dict[str, str] = {}
+        gen_meta: Dict[str, Dict[str, Any]] = {}
+        for model_name, port, tag in order:
+            model_dir = os.path.join(task_dir, tag)
+            mkdir_p(model_dir)
+            attempt = 1
+            try:
+                subdir, meta = await generate_and_save_app(model_dir, model_name, task, attempt, self.system_prompt)
+                gen_dirs[tag] = subdir
+                gen_meta[tag] = meta
+            except Exception as e:
+                write_text(os.path.join(model_dir, "error.txt"), f"generation error: {e}")
+                if self.status_container is not None:
+                    with self.status_container:
+                        ui.label(f"Generation failed for {tag}: {e}").classes('text-red-600')
+                gen_dirs[tag] = model_dir
+
+        # Start both apps concurrently
+        self.procs = {}
+        for model_name, port, tag in order:
+            app_dir = gen_dirs[tag]
+            try:
+                proc, out_f, err_f = await start_app_subprocess(app_dir, port)
+                self.procs[tag] = (proc, out_f, err_f)
+            except Exception as e:
+                write_text(os.path.join(app_dir, "start_error.txt"), f"start error: {e}")
+                if self.status_container is not None:
+                    with self.status_container:
+                        ui.label(f"Start failed for {tag}: {e}").classes('text-red-600')
+
+        # Wait for startup
+        started_a, started_b = await asyncio.gather(
+            wait_for_startup(PORT_A, task["timeouts"]["startup"]),
+            wait_for_startup(PORT_B, task["timeouts"]["startup"]),
+        )
+        if self.status_container is not None:
+            self.status_container.clear()
+            with self.status_container:
+                ui.label(f"Startup A: {'OK' if started_a else 'FAIL'}  B: {'OK' if started_b else 'FAIL'}")
+                # If failed, show stderr tail for quick diagnosis
+                for tag, started in ((order[0][2], started_a), (order[1][2], started_b)):
+                    if not started:
+                        try:
+                            err_path = os.path.join(gen_dirs[tag], "stderr.txt")
+                            tail = open(err_path, 'r', encoding='utf-8').read()[-500:]
+                            ui.label(f"{tag} stderr tail:").classes('text-red-600')
+                            ui.label(tail).classes('text-xs text-red-600 whitespace-pre-wrap')
+                        except Exception:
+                            pass
+
+        # Show manual iframes
+        if self.iframes_container is not None:
+            self.iframes_container.clear()
+            with self.iframes_container:
+                ui.label(f"Manual review: {task['title']}")
+                with ui.row().classes('w-full gap-4'):
+                    # Find which port corresponds to model A and B using actual ports from order
+                    port_for_a = order[0][1] if order[0][2] == "A" else order[1][1]
+                    port_for_b = order[0][1] if order[0][2] == "B" else order[1][1]
+                    # Always display model A on the left
+                    with ui.column().classes('flex-1'):
+                        ui.label(f'Model A: {self.model_a}').classes('font-semibold mb-2')
+                        ui.html(f'<iframe src="http://127.0.0.1:{port_for_a}/" style="width:100%;height:420px;border:1px solid #ddd;"></iframe>', sanitize=False)
+                    with ui.column().classes('flex-1'):
+                        ui.label(f'Model B: {self.model_b}').classes('font-semibold mb-2')
+                        ui.html(f'<iframe src="http://127.0.0.1:{port_for_b}/" style="width:100%;height:420px;border:1px solid #ddd;"></iframe>', sanitize=False)
+
+        # Create default failed results
+        res_a = ModelRunResult(0.0, False, False, False, False, False, ["startup failed"])
+        res_b = ModelRunResult(0.0, False, False, False, False, False, ["startup failed"])
+
+        # Only run automated evaluation if both apps started successfully
+        if started_a and started_b:
+            try:
+                # Automated probes
+                logs_a: List[Dict[str, Any]] = []
+                logs_b: List[Dict[str, Any]] = []
+                
+                res_a, res_b = await asyncio.gather(
+                    evaluate_model(gen_dirs[order[0][2]], PORT_A, task, task["timeouts"], logs_a),
+                    evaluate_model(gen_dirs[order[1][2]], PORT_B, task, task["timeouts"], logs_b),
+                )
+                
+                # Archive logs
+                write_text(os.path.join(gen_dirs[order[0][2]], "probe_logs.jsonl"), "\n".join(json.dumps(x) for x in logs_a))
+                write_text(os.path.join(gen_dirs[order[1][2]], "probe_logs.jsonl"), "\n".join(json.dumps(x) for x in logs_b))
+            except Exception as e:
+                # If evaluation fails, keep the failed results but log the error
+                if self.status_container is not None:
+                    with self.status_container:
+                        ui.label(f"Evaluation error: {e}").classes('text-red-600')
+
+        # Optional re-generation if < 3.5
+        async def maybe_regen(tag: str, res: ModelRunResult) -> ModelRunResult:
+            if res.score >= 3.5:
+                return res
+            model_name = order[0][0] if tag == order[0][2] else order[1][0]
+            parent_dir = os.path.join(task_dir, tag)
+            subdir, _ = generate_and_save_app(parent_dir, model_name, task, 2, self.system_prompt)
+            # restart app on same port
+            # Kill old proc is complex since we used asyncio subprocess; to simplify, we skip auto-regen live run
+            # and just keep the first attempt's score for now
+            return res
+
+        res_a = await maybe_regen(order[0][2], res_a)
+        res_b = await maybe_regen(order[1][2], res_b)
+
+        # Collect results - map back to model A and model B consistently
+        # res_a is from PORT_A, res_b is from PORT_B
+        # order[0] is what's on PORT_A, order[1] is what's on PORT_B
+        # Map scores to the correct model regardless of which port they ran on
+        if order[0][2] == "A":
+            # Model A on PORT_A, Model B on PORT_B
+            model_a_score = res_a.score
+            model_b_score = res_b.score
+        else:
+            # Model B on PORT_A, Model A on PORT_B
+            model_a_score = res_b.score
+            model_b_score = res_a.score
+
+        # Update or add result for this task
+        task_result = {
+            "task_id": task["id"],
+            "task_title": task["title"],
+            "A_score": model_a_score,
+            "B_score": model_b_score,
+        }
+        # Remove existing result for this task if any
+        self.results = [r for r in self.results if r["task_id"] != task["id"]]
+        self.results.append(task_result)
+
+        # Update status UI
+        if self.status_container is not None:
+            self.status_container.clear()
+            with self.status_container:
+                ui.label(f"Completed: {task['title']} -> A {model_a_score:.2f}, B {model_b_score:.2f}")
+        
+        # Update results display
+        self.update_results_display()
 
 
 runner = SuiteRunner()
@@ -582,16 +616,21 @@ with ui.column().classes('w-full p-4 gap-3'):
         model_a_input = ui.input(label='Model A', value=runner.model_a).classes('w-64')
         model_b_input = ui.input(label='Model B', value=runner.model_b).classes('w-64')
         system_prompt_input = ui.textarea(label='System prompt', value=runner.system_prompt).classes('w-[600px]')
-        async def start_clicked() -> None:
+
+    ui.separator()
+    ui.label('Select a task to build').classes('text-xl font-semibold')
+    
+    def make_task_handler(task_obj, task_idx):
+        async def handler():
             runner.model_a = model_a_input.value.strip()
             runner.model_b = model_b_input.value.strip()
             runner.system_prompt = system_prompt_input.value
-            if runner.status_container is not None:
-                runner.status_container.clear()
-                with runner.status_container:
-                    ui.label('Starting suite...')
-            asyncio.create_task(runner.run_suite())
-        ui.button('Start', on_click=lambda: asyncio.create_task(start_clicked()))
+            await runner.run_task(task_obj, task_idx)
+        return handler
+    
+    with ui.grid(columns=2).classes('w-full gap-2'):
+        for idx, task in enumerate(tasks_list):
+            ui.button(task['title'], on_click=lambda h=make_task_handler(task, idx): asyncio.create_task(h())).classes('w-full')
 
     runner.iframes_container = ui.column().classes('w-full gap-2')
     runner.status_container = ui.column().classes('w-full gap-2')
